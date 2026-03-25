@@ -46,8 +46,8 @@ export default function MockBadge() {
 
         {/* Card info */}
         <div className="p-5">
-          <div className="text-base font-semibold text-white truncate">ETH Denver 2025</div>
-          <div className="text-sm text-zinc-400 mt-1">Feb 23, 2025 · Denver, CO</div>
+          <div className="text-base font-semibold text-white truncate">Solana Summit 2025</div>
+          <div className="text-sm text-zinc-400 mt-1">Mar 15, 2025 · San Francisco, CA</div>
           <div className="mt-3 flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             <span className="text-sm text-zinc-500 font-mono">On-chain · Solana</span>
