@@ -43,8 +43,6 @@ Deno.serve(async (req) => {
     const exp = now + 30;
     const token = { event: event_id, exp, nonce: randNonce(), ver: 1 };
 
-    console.log(`[QR-ISSUE] Generated token for event ${event_id}, expires in 30s at ${exp} (now: ${now})`);
-
     const msg = u8(JSON.stringify(token));
     const digest = await sha256(msg);
     const secret = b64ToU8(keyRow.secret_b64);

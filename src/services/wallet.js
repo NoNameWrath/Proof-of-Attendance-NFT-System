@@ -26,29 +26,37 @@ export async function getUserWallet() {
  * The function already handles duplicates. If wallet already exists,
  * it returns { alreadyExists: true, public_key: "..." }
  */
-export async function createWallet(address, secretKey) {
+export async function createWallet() {
+  // must be logged in (edge fn has verify_jwt = true)
   const { data: { session } } = await supabase.auth.getSession();
+  if (!session) throw new Error("Not logged in");
 
+  // generate keypair client-side
+  const { Keypair } = await import("@solana/web3.js");
+  const kp = Keypair.generate();
+  const address = kp.publicKey.toBase58();
+  const secretKeyB64 = btoa(String.fromCharCode(...kp.secretKey)); // 64 bytes → b64
+  // persist via edge function (idempotent)
   const { data, error } = await supabase.functions.invoke("wallet", {
-    body: { address, secretKey },
-    headers: { Authorization: `Bearer ${session?.access_token ?? ""}` },
+    body: { address, secretKey: secretKeyB64 },
+    headers: { Authorization: `Bearer ${session.access_token}` },
+  });
+  if (error) throw error;
+  return { ...data, address, secretKey: secretKeyB64 };
+}
+export async function getUserSecretKey() {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) throw new Error("Not logged in");
+
+  // Call the edge function GET endpoint which decrypts the key server-side.
+  // Never read secret_key directly from the DB on the client.
+  const { data, error } = await supabase.functions.invoke("wallet", {
+    method: "GET",
+    headers: { Authorization: `Bearer ${session.access_token}` },
   });
 
   if (error) throw error;
+  if (!data?.secret_key) throw new Error("No secret key found");
 
-  return data;
-}
-export async function getUserSecretKey() {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) throw new Error("Not logged in");
-
-  const { data, error } = await supabase
-    .from("wallets")
-    .select("secret_key")
-    .eq("user_email", user.email)
-    .maybeSingle();
-
-  if (error) throw error;
-  // secret_key may be jsonb (array) or text; just return as-is
-  return data?.secret_key ?? null;
+  return data.secret_key;
 }

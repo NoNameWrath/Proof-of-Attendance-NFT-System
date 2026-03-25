@@ -5,9 +5,11 @@ export const useAppStore = create((set, get) => ({
   nfts: [], // array of { id, name, image, description }
   qrSecret: 'event-001',
   qrIntervalSec: 8,
+  isAdmin: false,
 
   setWallet: (wallet) => set({ wallet }),
   setNFTs: (nfts) => set({ nfts }),
+  setIsAdmin: (v) => set({ isAdmin: v }),
   rotateSecret: () => {
     const s = get().qrSecret;
     const t = Date.now();

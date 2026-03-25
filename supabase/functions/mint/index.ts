@@ -75,6 +75,21 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: "Missing fields" }), { status: 400, headers: corsHeaders(origin) });
     }
 
+    // ── Rate limiting: max 10 mints per user per 60 seconds ──────────────────
+    const oneMinuteAgo = new Date(Date.now() - 60_000).toISOString();
+    const { count: recentCount } = await supabase
+      .from("passes")
+      .select("id", { count: "exact", head: true })
+      .eq("user_email", user.email ?? "")
+      .gte("created_at", oneMinuteAgo);
+
+    if ((recentCount ?? 0) >= 10) {
+      return new Response(
+        JSON.stringify({ error: "Too many requests — please wait before minting again." }),
+        { status: 429, headers: corsHeaders(origin) }
+      );
+    }
+
     // Fetch event details
     const { data: ev, error: evErr } = await supabase
       .from("events")
@@ -120,11 +135,44 @@ Deno.serve(async (req) => {
       if (signer !== keyRow.public_key) return new Response(JSON.stringify({ error: "Signer mismatch" }), { status: 400, headers: corsHeaders(origin) });
     }
 
-    // idempotency
-    const { data: pass } = await supabase
-      .from("passes").select("minted_asset").eq("event_id", event_id).eq("wallet_pubkey", wallet_pubkey).maybeSingle();
-    if (pass?.minted_asset) {
-      return new Response(JSON.stringify({ ok: true, minted_asset: pass.minted_asset, reused: true }), { status: 200, headers: corsHeaders(origin) });
+    // ── Idempotency + race-free reservation ──────────────────────────────────
+    // We insert a placeholder row BEFORE minting so that concurrent requests
+    // claiming the same (event_id, wallet_pubkey) hit a unique-constraint error
+    // on the DB insert rather than both reaching the on-chain mint step.
+    // Requires: UNIQUE constraint on passes(event_id, wallet_pubkey).
+    //
+    // 1. Check for a completed mint first (fast path).
+    const { data: existingPass } = await supabase
+      .from("passes")
+      .select("minted_asset")
+      .eq("event_id", event_id)
+      .eq("wallet_pubkey", wallet_pubkey)
+      .maybeSingle();
+
+    if (existingPass?.minted_asset) {
+      return new Response(
+        JSON.stringify({ ok: true, minted_asset: existingPass.minted_asset, reused: true }),
+        { status: 200, headers: corsHeaders(origin) }
+      );
+    }
+
+    // 2. Reserve the slot atomically. If another concurrent request already
+    //    reserved it, the unique constraint fires and we return 409 without
+    //    ever reaching the expensive on-chain mint.
+    const { data: reserved, error: reserveErr } = await supabase
+      .from("passes")
+      .insert([{ event_id, user_email: user.email ?? "", wallet_pubkey, minted_asset: null }])
+      .select("id")
+      .single();
+
+    if (reserveErr) {
+      if (/duplicate|unique/i.test(reserveErr.message ?? "")) {
+        return new Response(
+          JSON.stringify({ error: "Mint already in progress for this wallet. Please wait." }),
+          { status: 409, headers: corsHeaders(origin) }
+        );
+      }
+      throw reserveErr;
     }
 
     // ----- Prepare metadata -----
@@ -132,29 +180,23 @@ Deno.serve(async (req) => {
     
     // If metadata_uri is null, try to fetch from storage or create inline
     if (!metadataUri) {
-      console.log("No metadata_uri in DB, checking storage...");
-      
       // Try to get public URL from storage
       const metaPath = `events/${event_id}/metadata.json`;
       const { data: storageData } = supabase.storage.from("poap").getPublicUrl(metaPath);
-      
+
       if (storageData?.publicUrl) {
-        // Verify it exists by fetching
         try {
           const checkRes = await fetch(storageData.publicUrl);
           if (checkRes.ok) {
             metadataUri = storageData.publicUrl;
-            console.log("Found metadata in storage:", metadataUri);
           }
-        } catch (e) {
-          console.log("Metadata not found in storage, will use inline");
+        } catch (_e) {
+          // not in storage, will create inline
         }
       }
-      
+
       // If still no URI, create inline metadata
       if (!metadataUri) {
-        console.log("Creating inline metadata URL");
-        // Create a data URI with the metadata
         const imageUrl = ev.image_url || "https://dummyimage.com/512x512/333333/ffffff.png&text=POAP";
         const metadata = {
           name: ev.name || "POAP",
@@ -186,7 +228,6 @@ Deno.serve(async (req) => {
         } else {
           const { data: publicData } = supabase.storage.from("poap").getPublicUrl(metaPath);
           metadataUri = publicData.publicUrl;
-          console.log("Uploaded metadata to:", metadataUri);
         }
       }
     }
@@ -207,13 +248,48 @@ Deno.serve(async (req) => {
     const signerUmi = createSignerFromKeypair(umi, keypair);
     umi.use(keypairIdentity(signerUmi));
 
+    // ── SOL balance check ─────────────────────────────────────────────────────
+    const balance = await umi.rpc.getBalance(keypair.publicKey);
+    const solBalance = Number(balance.basisPoints) / 1e9;
+    const WARN_SOL = 0.1;
+    const FAIL_SOL = 0.01;
+
+    const sendBalanceAlert = (critical: boolean) => {
+      const resendKey = Deno.env.get("RESEND_API_KEY");
+      if (!resendKey) return Promise.resolve();
+      return fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${resendKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from: "POAP <onboarding@resend.dev>",
+          to: "mabejo2005@gmail.com",
+          subject: critical
+            ? `CRITICAL: POAP fee wallet empty (${solBalance.toFixed(4)} SOL)`
+            : `Warning: POAP fee wallet low (${solBalance.toFixed(4)} SOL)`,
+          html: critical
+            ? `<h2>Fee Payer Wallet Empty</h2><p>Balance: <strong>${solBalance.toFixed(4)} SOL</strong> — minting is now failing. Top up immediately.</p>`
+            : `<h2>Low SOL Balance Warning</h2><p>Balance: <strong>${solBalance.toFixed(4)} SOL</strong> — top up soon to keep minting working.</p>`,
+        }),
+      }).catch(() => {});
+    };
+
+    if (solBalance < FAIL_SOL) {
+      await sendBalanceAlert(true);
+      return new Response(
+        JSON.stringify({ error: "Service temporarily unavailable — contact the organizer." }),
+        { status: 503, headers: corsHeaders(origin) }
+      );
+    }
+
+    if (solBalance < WARN_SOL) {
+      sendBalanceAlert(false); // fire-and-forget
+    }
+
     // Generate a new keypair for the NFT asset
     const asset = generateSigner(umi);
     
     const name = ev.name || "POAP";
     const uri = metadataUri;
-
-    console.log("Minting NFT:", { name, uri, owner: wallet_pubkey });
 
     // Create the NFT with the asset address
     await coreMod.create(umi, { 
@@ -226,19 +302,16 @@ Deno.serve(async (req) => {
     // Store the asset's public key (the NFT address)
     const mintedAssetAddress = asset.publicKey;
 
-    // persist
-    const { error: insErr } = await supabase
+    // Update the reserved row with the real asset address
+    const { error: updateErr } = await supabase
       .from("passes")
-      .insert([{ 
-        event_id, 
-        user_email: user.email ?? "", 
-        wallet_pubkey, 
-        minted_asset: mintedAssetAddress 
-      }]);
-    if (insErr) {
-      const msg = insErr.message ?? String(insErr);
-      const code = /duplicate|unique/i.test(msg) ? 409 : 500;
-      return new Response(JSON.stringify({ error: "DB insert failed", detail: msg }), { status: code, headers: corsHeaders(origin) });
+      .update({ minted_asset: mintedAssetAddress })
+      .eq("id", reserved.id);
+
+    if (updateErr) {
+      // NFT is minted on-chain but the DB record is incomplete.
+      // Log for manual recovery — still return success so the user knows the mint went through.
+      console.error("Failed to update minted_asset on reserved pass:", updateErr.message);
     }
 
     return new Response(JSON.stringify({ ok: true, minted_asset: mintedAssetAddress }), { status: 201, headers: corsHeaders(origin) });

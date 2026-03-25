@@ -20,9 +20,15 @@ Deno.serve(async (req) => {
     const auth = req.headers.get("Authorization") ?? "";
     const supabase = createClient(PROJECT_URL, ANON_KEY, { global: { headers: { Authorization: auth } } });
 
-    // only authed users (you can add role checks later)
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: cors });
+
+    // Verify admin status
+    const { data: adminRow } = await supabase
+      .from("admins").select("email").eq("email", user.email).maybeSingle();
+    if (!adminRow) {
+      return new Response(JSON.stringify({ error: "Forbidden - admin access required" }), { status: 403, headers: cors });
+    }
 
     const body = await req.json();
     const { name, starts_at, ends_at } = body ?? {};
