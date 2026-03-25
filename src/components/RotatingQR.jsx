@@ -51,6 +51,7 @@ export default function RotatingQR({ eventId, intervalMs = 10000 }) {
     fetchToken();
     timerRef.current = setInterval(fetchToken, intervalMs);
     return () => clearInterval(timerRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventId, intervalMs]);
 
   useEffect(() => {
